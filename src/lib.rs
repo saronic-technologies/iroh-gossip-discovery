@@ -220,16 +220,16 @@ impl GossipDiscoveryReceiver {
                         }
                     };
 
-                    // Verify that the claimed node_id matches the public key
-                    let expected_node_id = NodeId::from(verifying_key);
-                    if value.node_id != expected_node_id {
-                        warn!(
-                            claimed_node_id = %value.node_id,
-                            actual_node_id = %expected_node_id,
-                            "NodeId spoofing attempt detected, ignoring message"
-                        );
-                        continue;
-                    }
+                    // // Verify that the claimed node_id matches the public key
+                    // let expected_node_id = NodeId::from(verifying_key);
+                    // if value.node_id != expected_node_id {
+                    //     warn!(
+                    //         claimed_node_id = %value.node_id,
+                    //         actual_node_id = %expected_node_id,
+                    //         "NodeId spoofing attempt detected, ignoring message"
+                    //     );
+                    //     continue;
+                    // }
 
                     let is_new_peer = !self.neighbor_map.contains_key(&value.name);
 
