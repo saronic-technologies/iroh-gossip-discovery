@@ -15,7 +15,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::{sleep, Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -45,26 +45,26 @@ impl SignedMessage {
             .into();
         let signature = secret_key.sign(&data);
         let from: VerifyingKey = secret_key.verifying_key();
-        
+
         let signed_message = Self {
             from,
             data,
             signature,
         };
-        
+
         let encoded = postcard::to_stdvec(&signed_message)
             .map_err(|e| GossipDiscoveryError::Serialization(e.to_string()))?;
         Ok(encoded.into())
     }
-    
+
     pub fn verify_and_decode(bytes: &[u8]) -> Result<(VerifyingKey, Node)> {
         let signed_message: Self = postcard::from_bytes(bytes)
             .map_err(|e| GossipDiscoveryError::Deserialization(e.to_string()))?;
         let key: VerifyingKey = signed_message.from;
-        
+
         key.verify(&signed_message.data, &signed_message.signature)
             .map_err(|e| GossipDiscoveryError::SignatureVerification(e.to_string()))?;
-        
+
         let node: Node = postcard::from_bytes(&signed_message.data)
             .map_err(|e| GossipDiscoveryError::Deserialization(e.to_string()))?;
         Ok((signed_message.from, node))
@@ -112,7 +112,7 @@ impl GossipDiscoveryBuilder {
         peers: Vec<NodeId>,
         endpoint: &iroh::Endpoint,
     ) -> Result<(GossipDiscoverySender, GossipDiscoveryReceiver)> {
-        // - First node (empty peers): use subscribe() only  
+        // - First node (empty peers): use subscribe() only
         // - Other nodes (with peers): use subscribe_and_join()
         info!("Attempting to subscribe to gossip topic");
         let (sender, receiver) = gossip.subscribe(topic_id, peers)?.split();
@@ -126,7 +126,11 @@ impl GossipDiscoveryBuilder {
         let node_secret = endpoint.secret_key();
         let secret_key_bytes = node_secret.to_bytes();
         let secret_key = SigningKey::from_bytes(&secret_key_bytes);
-        let discovery_sender = GossipDiscoverySender { peer_rx, sender, secret_key };
+        let discovery_sender = GossipDiscoverySender {
+            peer_rx,
+            sender,
+            secret_key,
+        };
 
         let expiration_timeout = self.expiration_timeout.unwrap_or(Duration::from_secs(30));
 
@@ -154,7 +158,10 @@ impl GossipDiscoverySender {
     /// Add external peers to the gossip network
     pub async fn add_peers(&mut self, peers: Vec<NodeId>) -> Result<()> {
         if !peers.is_empty() {
-            info!(peer_count = peers.len(), "Adding external peers to gossip network");
+            info!(
+                peer_count = peers.len(),
+                "Adding external peers to gossip network"
+            );
             self.sender.join_peers(peers).await?;
         }
         Ok(())
@@ -212,13 +219,14 @@ impl GossipDiscoveryReceiver {
             match res {
                 Ok(Event::Gossip(GossipEvent::Received(msg))) => {
                     // Verify and decode the signed message
-                    let (verifying_key, value) = match SignedMessage::verify_and_decode(&msg.content) {
-                        Ok(result) => result,
-                        Err(e) => {
-                            warn!(%e, "Failed to verify message signature, ignoring");
-                            continue;
-                        }
-                    };
+                    let (verifying_key, value) =
+                        match SignedMessage::verify_and_decode(&msg.content) {
+                            Ok(result) => result,
+                            Err(e) => {
+                                warn!(%e, "Failed to verify message signature, ignoring");
+                                continue;
+                            }
+                        };
 
                     // // Verify that the claimed node_id matches the public key
                     // let expected_node_id = NodeId::from(verifying_key);
