@@ -23,6 +23,8 @@
             pkg-config
             rust-bin.nightly.latest.default
             rust-analyzer
+            nodejs_24
+            git
           ];
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
         };

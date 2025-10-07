@@ -3,7 +3,7 @@ use dashmap::DashMap;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures::StreamExt;
 
-use iroh::NodeId;
+use iroh::{NodeId, PublicKey};
 use iroh_gossip::{
     net::{Event, Gossip, GossipEvent, GossipReceiver, GossipSender},
     proto::TopicId,
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
 
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{error::TryRecvError, UnboundedReceiver, UnboundedSender};
 use tokio::time::{sleep, Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -114,9 +114,9 @@ impl GossipDiscoveryBuilder {
     ) -> Result<(GossipDiscoverySender, GossipDiscoveryReceiver)> {
         // - First node (empty peers): use subscribe() only
         // - Other nodes (with peers): use subscribe_and_join()
-        info!("Attempting to subscribe to gossip topic");
+        info!(topic_id = ?topic_id, peers = ?peers, "Attempting to subscribe to gossip");
         let (sender, receiver) = gossip.subscribe(topic_id, peers)?.split();
-        info!("Subscribed to gossip topic");
+        info!(topic_id = ?topic_id, "Subscribed to gossip topic");
 
         let (peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel();
         let neighbor_map = Arc::new(DashMap::new());
@@ -184,7 +184,10 @@ impl GossipDiscoverySender {
                         error!(%e, "Failed to join peer");
                     }
                 }
-                Err(_) => {}
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    warn!("peer_rx channel's sending half has been disconnected!");
+                }
             }
 
             let update_node = Node {
@@ -219,14 +222,13 @@ impl GossipDiscoveryReceiver {
             match res {
                 Ok(Event::Gossip(GossipEvent::Received(msg))) => {
                     // Verify and decode the signed message
-                    let (verifying_key, value) =
-                        match SignedMessage::verify_and_decode(&msg.content) {
-                            Ok(result) => result,
-                            Err(e) => {
-                                warn!(%e, "Failed to verify message signature, ignoring");
-                                continue;
-                            }
-                        };
+                    let (_, value) = match SignedMessage::verify_and_decode(&msg.content) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            warn!(%e, "Failed to verify message signature, ignoring");
+                            continue;
+                        }
+                    };
 
                     // // Verify that the claimed node_id matches the public key
                     // let expected_node_id = NodeId::from(verifying_key);
@@ -239,7 +241,7 @@ impl GossipDiscoveryReceiver {
                     //     continue;
                     // }
 
-                    let is_new_peer = !self.neighbor_map.contains_key(&value.name);
+                    let is_new_peer = !self._is_neighbor(&value.name, &value.node_id);
 
                     if is_new_peer {
                         // Send new peer to sender for joining
@@ -247,6 +249,12 @@ impl GossipDiscoveryReceiver {
                             .send(value.node_id)
                             .map_err(|_| GossipDiscoveryError::ChannelSend)?;
                         info!(name = %value.name, node_id = %value.node_id, "Discovered new peer");
+                    } else {
+                        info!(
+                            name = value.name,
+                            node_id = %value.node_id,
+                            "Ignoring existing peer"
+                        );
                     }
 
                     self.neighbor_map.insert(
@@ -264,7 +272,24 @@ impl GossipDiscoveryReceiver {
                 }
             }
         }
+
+        info!("Finished GossipDiscoveryReceiver update map, exiting");
         Ok(())
+    }
+
+    fn _is_neighbor(&self, name: &str, node_id: &PublicKey) -> bool {
+        // We need to check two conditions to determine whether the specified
+        // node is an existing neighbor:
+        //
+        // 1. Is there a neighbor with the same name already? This is a
+        //    unique identifier associated with a node, but not unique per
+        //    execution
+        // 2. If there is a neighbor, check to see if the node id is identical.
+        //    If the node id is not identical, then this is a new peer
+        match self.neighbor_map.get(name) {
+            Some(node_info) => node_info.node_id.eq(&node_id),
+            None => false,
+        }
     }
 
     pub fn get_neighbors(&self) -> Vec<(String, NodeId)> {
@@ -275,31 +300,7 @@ impl GossipDiscoveryReceiver {
     }
 
     pub fn cleanup_expired_nodes(&self) -> usize {
-        let now = Instant::now();
-        let mut expired_count = 0;
-
-        // Collect expired node names first to avoid holding locks
-        let expired_nodes: Vec<String> = self
-            .neighbor_map
-            .iter()
-            .filter_map(|entry| {
-                if now.duration_since(entry.value().last_seen) > self.expiration_timeout {
-                    Some(entry.key().clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Remove expired nodes
-        for node_name in expired_nodes {
-            if let Some((_, node_info)) = self.neighbor_map.remove(&node_name) {
-                info!(name = %node_name, node_id = %node_info.node_id, "Expired node");
-                expired_count += 1;
-            }
-        }
-
-        expired_count
+        GossipDiscoveryReceiver::_cleanup_expired_nodes(&self.neighbor_map, self.expiration_timeout)
     }
 
     pub fn start_cleanup_task(
@@ -312,33 +313,395 @@ impl GossipDiscoveryReceiver {
             loop {
                 sleep(cleanup_interval).await;
 
-                let now = Instant::now();
-                let mut expired_count = 0;
-
-                // Collect expired node names first to avoid holding locks
-                let expired_nodes: Vec<String> = neighbor_map
-                    .iter()
-                    .filter_map(|entry| {
-                        if now.duration_since(entry.value().last_seen) > expiration_timeout {
-                            Some(entry.key().clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                // Remove expired nodes
-                for node_name in expired_nodes {
-                    if let Some((_, node_info)) = neighbor_map.remove(&node_name) {
-                        info!(name = %node_name, node_id = %node_info.node_id, "Expired node");
-                        expired_count += 1;
-                    }
-                }
+                let expired_count = GossipDiscoveryReceiver::_cleanup_expired_nodes(
+                    &neighbor_map,
+                    expiration_timeout,
+                );
 
                 if expired_count > 0 {
                     info!(count = expired_count, "Cleaned up expired nodes");
                 }
             }
         });
+    }
+
+    fn _cleanup_expired_nodes(
+        neighbor_map: &Arc<DashMap<String, NodeInfo>>,
+        expiration_timeout: Duration,
+    ) -> usize {
+        let now = Instant::now();
+        let mut expired_count = 0;
+
+        // Collect expired node names first to avoid holding locks
+        let expired_nodes: Vec<String> = neighbor_map
+            .iter()
+            .filter_map(|entry| {
+                if now.duration_since(entry.value().last_seen) > expiration_timeout {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Remove expired nodes
+        for node_name in expired_nodes {
+            if let Some((_, node_info)) = neighbor_map.remove(&node_name) {
+                info!(name = %node_name, node_id = %node_info.node_id, "Expired node");
+                expired_count += 1;
+            }
+        }
+
+        expired_count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper function to create valid NodeIds for testing
+    fn create_test_node_id(seed: u8) -> NodeId {
+        let signing_key = SigningKey::from_bytes(&[seed; 32]);
+        NodeId::from(signing_key.verifying_key())
+    }
+
+    // Helper to create a GossipDiscoveryReceiver for testing
+    async fn create_test_receiver(
+        neighbor_map: Arc<DashMap<String, NodeInfo>>,
+    ) -> GossipDiscoveryReceiver {
+        // Create a test endpoint
+        let endpoint = iroh::Endpoint::builder()
+            .discovery_n0()
+            .bind()
+            .await
+            .expect("Failed to create test endpoint");
+
+        // Create gossip instance
+        let gossip = Gossip::builder()
+            .spawn(endpoint.clone())
+            .await
+            .expect("Failed to spawn gossip");
+
+        // Create a test topic
+        let topic_id = TopicId::from([0u8; 32]);
+
+        // Subscribe to get a receiver
+        let (_, receiver) = gossip
+            .subscribe(topic_id, vec![])
+            .expect("Failed to subscribe")
+            .split();
+
+        let (peer_tx, _peer_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        GossipDiscoveryReceiver {
+            neighbor_map,
+            peer_tx,
+            receiver,
+            expiration_timeout: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn test_cleanup_expired_nodes_empty_map() {
+        let neighbor_map = Arc::new(DashMap::new());
+        let expiration_timeout = Duration::from_secs(10);
+
+        let expired_count =
+            GossipDiscoveryReceiver::_cleanup_expired_nodes(&neighbor_map, expiration_timeout);
+
+        assert_eq!(expired_count, 0);
+        assert_eq!(neighbor_map.len(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_expired_nodes_no_expired() {
+        let neighbor_map = Arc::new(DashMap::new());
+        let expiration_timeout = Duration::from_secs(10);
+
+        // Add fresh nodes
+        let node_id = create_test_node_id(1);
+        neighbor_map.insert(
+            "alice".to_string(),
+            NodeInfo {
+                node_id,
+                last_seen: Instant::now(),
+            },
+        );
+
+        let node_id2 = create_test_node_id(2);
+        neighbor_map.insert(
+            "bob".to_string(),
+            NodeInfo {
+                node_id: node_id2,
+                last_seen: Instant::now(),
+            },
+        );
+
+        let expired_count =
+            GossipDiscoveryReceiver::_cleanup_expired_nodes(&neighbor_map, expiration_timeout);
+
+        assert_eq!(expired_count, 0);
+        assert_eq!(neighbor_map.len(), 2);
+        assert!(neighbor_map.contains_key("alice"));
+        assert!(neighbor_map.contains_key("bob"));
+    }
+
+    #[test]
+    fn test_cleanup_expired_nodes_all_expired() {
+        let neighbor_map = Arc::new(DashMap::new());
+        let expiration_timeout = Duration::from_millis(100);
+
+        // Add nodes with old timestamps
+        let old_instant = Instant::now() - Duration::from_secs(1);
+
+        let node_id = create_test_node_id(1);
+        neighbor_map.insert(
+            "alice".to_string(),
+            NodeInfo {
+                node_id,
+                last_seen: old_instant,
+            },
+        );
+
+        let node_id2 = create_test_node_id(2);
+        neighbor_map.insert(
+            "bob".to_string(),
+            NodeInfo {
+                node_id: node_id2,
+                last_seen: old_instant,
+            },
+        );
+
+        let expired_count =
+            GossipDiscoveryReceiver::_cleanup_expired_nodes(&neighbor_map, expiration_timeout);
+
+        assert_eq!(expired_count, 2);
+        assert_eq!(neighbor_map.len(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_expired_nodes_boundary_case() {
+        let neighbor_map = Arc::new(DashMap::new());
+        let expiration_timeout = Duration::from_millis(100);
+
+        // Add node that's exactly at the expiration boundary
+        let boundary_instant = Instant::now() - Duration::from_millis(100);
+        let node_id = create_test_node_id(1);
+        neighbor_map.insert(
+            "alice".to_string(),
+            NodeInfo {
+                node_id,
+                last_seen: boundary_instant,
+            },
+        );
+
+        // Small sleep to ensure we're past the boundary
+        std::thread::sleep(Duration::from_millis(10));
+
+        let expired_count =
+            GossipDiscoveryReceiver::_cleanup_expired_nodes(&neighbor_map, expiration_timeout);
+
+        assert_eq!(expired_count, 1);
+        assert_eq!(neighbor_map.len(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_expired_nodes_multiple_expired() {
+        let neighbor_map = Arc::new(DashMap::new());
+        let expiration_timeout = Duration::from_millis(50);
+
+        // Add multiple expired nodes
+        let old_instant = Instant::now() - Duration::from_secs(1);
+
+        for i in 0..5 {
+            let node_id = create_test_node_id(i);
+            neighbor_map.insert(
+                format!("node_{}", i),
+                NodeInfo {
+                    node_id,
+                    last_seen: old_instant,
+                },
+            );
+        }
+
+        // Add some fresh nodes
+        for i in 5..8 {
+            let node_id = create_test_node_id(i);
+            neighbor_map.insert(
+                format!("node_{}", i),
+                NodeInfo {
+                    node_id,
+                    last_seen: Instant::now(),
+                },
+            );
+        }
+
+        assert_eq!(neighbor_map.len(), 8);
+
+        let expired_count =
+            GossipDiscoveryReceiver::_cleanup_expired_nodes(&neighbor_map, expiration_timeout);
+
+        assert_eq!(expired_count, 5);
+        assert_eq!(neighbor_map.len(), 3);
+
+        // Verify remaining nodes
+        for i in 5..8 {
+            assert!(neighbor_map.contains_key(&format!("node_{}", i)));
+        }
+    }
+
+    #[test]
+    fn test_cleanup_expired_nodes_returns_correct_count() {
+        let neighbor_map = Arc::new(DashMap::new());
+        let expiration_timeout = Duration::from_millis(100);
+
+        // Add expired nodes
+        let old_instant = Instant::now() - Duration::from_secs(1);
+        for i in 0..10 {
+            let node_id = create_test_node_id(i);
+            neighbor_map.insert(
+                format!("expired_{}", i),
+                NodeInfo {
+                    node_id,
+                    last_seen: old_instant,
+                },
+            );
+        }
+
+        let expired_count =
+            GossipDiscoveryReceiver::_cleanup_expired_nodes(&neighbor_map, expiration_timeout);
+
+        assert_eq!(expired_count, 10);
+        assert_eq!(neighbor_map.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_is_neighbor_empty_map() {
+        let neighbor_map = Arc::new(DashMap::new());
+        let receiver = create_test_receiver(neighbor_map).await;
+        let node_id = create_test_node_id(1);
+        assert!(!receiver._is_neighbor("alice", &node_id));
+    }
+
+    #[tokio::test]
+    async fn test_is_neighbor_name_not_found() {
+        let neighbor_map = Arc::new(DashMap::new());
+
+        // Add a neighbor with a different name
+        let bob_node_id = create_test_node_id(1);
+        neighbor_map.insert(
+            "bob".to_string(),
+            NodeInfo {
+                node_id: bob_node_id,
+                last_seen: Instant::now(),
+            },
+        );
+
+        let receiver = create_test_receiver(neighbor_map).await;
+        let alice_node_id = create_test_node_id(2);
+        assert!(!receiver._is_neighbor("alice", &alice_node_id));
+    }
+
+    #[tokio::test]
+    async fn test_is_neighbor_name_found_same_node_id() {
+        let neighbor_map = Arc::new(DashMap::new());
+
+        let alice_node_id = create_test_node_id(1);
+        neighbor_map.insert(
+            "alice".to_string(),
+            NodeInfo {
+                node_id: alice_node_id,
+                last_seen: Instant::now(),
+            },
+        );
+
+        let receiver = create_test_receiver(neighbor_map).await;
+        // Same name, same node_id
+        assert!(receiver._is_neighbor("alice", &alice_node_id));
+    }
+
+    #[tokio::test]
+    async fn test_is_neighbor_name_found_different_node_id() {
+        let neighbor_map = Arc::new(DashMap::new());
+
+        // Add alice with node_id 1
+        let alice_node_id_1 = create_test_node_id(1);
+        neighbor_map.insert(
+            "alice".to_string(),
+            NodeInfo {
+                node_id: alice_node_id_1,
+                last_seen: Instant::now(),
+            },
+        );
+
+        let receiver = create_test_receiver(neighbor_map).await;
+        // Same name but different node_id (restarted node scenario)
+        let alice_node_id_2 = create_test_node_id(2);
+        assert!(!receiver._is_neighbor("alice", &alice_node_id_2));
+    }
+
+    #[tokio::test]
+    async fn test_is_neighbor_multiple_neighbors() {
+        let neighbor_map = Arc::new(DashMap::new());
+
+        // Add multiple neighbors
+        let alice_node_id = create_test_node_id(1);
+        let bob_node_id = create_test_node_id(2);
+        let charlie_node_id = create_test_node_id(3);
+
+        neighbor_map.insert(
+            "alice".to_string(),
+            NodeInfo {
+                node_id: alice_node_id,
+                last_seen: Instant::now(),
+            },
+        );
+        neighbor_map.insert(
+            "bob".to_string(),
+            NodeInfo {
+                node_id: bob_node_id,
+                last_seen: Instant::now(),
+            },
+        );
+        neighbor_map.insert(
+            "charlie".to_string(),
+            NodeInfo {
+                node_id: charlie_node_id,
+                last_seen: Instant::now(),
+            },
+        );
+
+        let receiver = create_test_receiver(neighbor_map).await;
+        // Check all existing neighbors return true
+        assert!(receiver._is_neighbor("alice", &alice_node_id));
+        assert!(receiver._is_neighbor("bob", &bob_node_id));
+        assert!(receiver._is_neighbor("charlie", &charlie_node_id));
+
+        // Check non-existent neighbor returns false
+        let dave_node_id = create_test_node_id(4);
+        assert!(!receiver._is_neighbor("dave", &dave_node_id));
+    }
+
+    #[tokio::test]
+    async fn test_is_neighbor_case_sensitive_name() {
+        let neighbor_map = Arc::new(DashMap::new());
+
+        let alice_node_id = create_test_node_id(1);
+        neighbor_map.insert(
+            "alice".to_string(),
+            NodeInfo {
+                node_id: alice_node_id,
+                last_seen: Instant::now(),
+            },
+        );
+
+        let receiver = create_test_receiver(neighbor_map).await;
+        // Exact match should work
+        assert!(receiver._is_neighbor("alice", &alice_node_id));
+
+        // Different case should not match
+        assert!(!receiver._is_neighbor("Alice", &alice_node_id));
+        assert!(!receiver._is_neighbor("ALICE", &alice_node_id));
     }
 }
