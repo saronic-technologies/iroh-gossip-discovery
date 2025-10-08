@@ -230,25 +230,24 @@ impl GossipDiscoveryReceiver {
                         }
                     };
 
-                    // // Verify that the claimed node_id matches the public key
-                    // let expected_node_id = NodeId::from(verifying_key);
-                    // if value.node_id != expected_node_id {
-                    //     warn!(
-                    //         claimed_node_id = %value.node_id,
-                    //         actual_node_id = %expected_node_id,
-                    //         "NodeId spoofing attempt detected, ignoring message"
-                    //     );
-                    //     continue;
-                    // }
-
-                    let is_new_peer = !self._is_neighbor(&value.name, &value.node_id);
-
-                    if is_new_peer {
+                    if value.name.is_empty() {
+                        // Ignore nodes who have empty names
+                        info!(name = value.name, node_id = %value.node_id, "Ignoring peer with no name")
+                    } else if !self._is_neighbor(&value.name, &value.node_id) {
                         // Send new peer to sender for joining
                         self.peer_tx
                             .send(value.node_id)
                             .map_err(|_| GossipDiscoveryError::ChannelSend)?;
                         info!(name = %value.name, node_id = %value.node_id, "Discovered new peer");
+
+                        self.neighbor_map.insert(
+                            value.name.clone(),
+                            NodeInfo {
+                                node_id: value.node_id,
+                                last_seen: Instant::now(),
+                            },
+                        );
+                        debug!(peer_count = self.neighbor_map.len(), "Address book updated");
                     } else {
                         info!(
                             name = value.name,
@@ -256,15 +255,6 @@ impl GossipDiscoveryReceiver {
                             "Ignoring existing peer"
                         );
                     }
-
-                    self.neighbor_map.insert(
-                        value.name.clone(),
-                        NodeInfo {
-                            node_id: value.node_id,
-                            last_seen: Instant::now(),
-                        },
-                    );
-                    debug!(peer_count = self.neighbor_map.len(), "Address book updated");
                 }
                 Ok(_) => {}
                 Err(e) => {
