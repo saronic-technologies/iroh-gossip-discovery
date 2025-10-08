@@ -230,31 +230,8 @@ impl GossipDiscoveryReceiver {
                         }
                     };
 
-                    if value.name.is_empty() {
-                        // Ignore nodes who have empty names
-                        info!(name = value.name, node_id = %value.node_id, "Ignoring peer with no name")
-                    } else if !self._is_neighbor(&value.name, &value.node_id) {
-                        // Send new peer to sender for joining
-                        self.peer_tx
-                            .send(value.node_id)
-                            .map_err(|_| GossipDiscoveryError::ChannelSend)?;
-                        info!(name = %value.name, node_id = %value.node_id, "Discovered new peer");
-                    } else {
-                        info!(
-                            name = value.name,
-                            node_id = %value.node_id,
-                            "Ignoring existing peer"
-                        );
-                    }
-
-                    self.neighbor_map.insert(
-                        value.name.clone(),
-                        NodeInfo {
-                            node_id: value.node_id,
-                            last_seen: Instant::now(),
-                        },
-                    );
-                    debug!(peer_count = self.neighbor_map.len(), "Address book updated");
+                    // Handle updating map
+                    self._execute_update_map(value)?;
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -264,6 +241,38 @@ impl GossipDiscoveryReceiver {
         }
 
         info!("Finished GossipDiscoveryReceiver update map, exiting");
+        Ok(())
+    }
+
+    fn _execute_update_map(&self, value: Node) -> Result<()> {
+        if value.name.is_empty() {
+            // Ignore nodes who have empty names
+            info!(name = value.name, node_id = %value.node_id, "Ignoring peer with no name")
+        } else {
+            if !self._is_neighbor(&value.name, &value.node_id) {
+                // Send new peer to sender for joining
+                self.peer_tx
+                    .send(value.node_id)
+                    .map_err(|_| GossipDiscoveryError::ChannelSend)?;
+                info!(name = %value.name, node_id = %value.node_id, "Discovered new peer");
+            } else {
+                info!(
+                    name = value.name,
+                    node_id = %value.node_id,
+                    "Ignoring existing peer"
+                );
+            }
+
+            self.neighbor_map.insert(
+                value.name.clone(),
+                NodeInfo {
+                    node_id: value.node_id,
+                    last_seen: Instant::now(),
+                },
+            );
+            debug!(peer_count = self.neighbor_map.len(), "Address book updated");
+        }
+
         Ok(())
     }
 
@@ -359,7 +368,7 @@ mod tests {
     // Helper to create a GossipDiscoveryReceiver for testing
     async fn create_test_receiver(
         neighbor_map: Arc<DashMap<String, NodeInfo>>,
-    ) -> GossipDiscoveryReceiver {
+    ) -> (GossipDiscoveryReceiver, UnboundedReceiver<NodeId>) {
         // Create a test endpoint
         let endpoint = iroh::Endpoint::builder()
             .discovery_n0()
@@ -382,14 +391,17 @@ mod tests {
             .expect("Failed to subscribe")
             .split();
 
-        let (peer_tx, _peer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        GossipDiscoveryReceiver {
-            neighbor_map,
-            peer_tx,
-            receiver,
-            expiration_timeout: Duration::from_secs(30),
-        }
+        (
+            GossipDiscoveryReceiver {
+                neighbor_map,
+                peer_tx,
+                receiver,
+                expiration_timeout: Duration::from_secs(30),
+            },
+            peer_rx,
+        )
     }
 
     #[test]
@@ -569,7 +581,7 @@ mod tests {
     #[tokio::test]
     async fn test_is_neighbor_empty_map() {
         let neighbor_map = Arc::new(DashMap::new());
-        let receiver = create_test_receiver(neighbor_map).await;
+        let (receiver, _peer_rx) = create_test_receiver(neighbor_map).await;
         let node_id = create_test_node_id(1);
         assert!(!receiver._is_neighbor("alice", &node_id));
     }
@@ -588,7 +600,7 @@ mod tests {
             },
         );
 
-        let receiver = create_test_receiver(neighbor_map).await;
+        let (receiver, _peer_rx) = create_test_receiver(neighbor_map).await;
         let alice_node_id = create_test_node_id(2);
         assert!(!receiver._is_neighbor("alice", &alice_node_id));
     }
@@ -606,7 +618,7 @@ mod tests {
             },
         );
 
-        let receiver = create_test_receiver(neighbor_map).await;
+        let (receiver, _peer_rx) = create_test_receiver(neighbor_map).await;
         // Same name, same node_id
         assert!(receiver._is_neighbor("alice", &alice_node_id));
     }
@@ -625,7 +637,7 @@ mod tests {
             },
         );
 
-        let receiver = create_test_receiver(neighbor_map).await;
+        let (receiver, _peer_rx) = create_test_receiver(neighbor_map).await;
         // Same name but different node_id (restarted node scenario)
         let alice_node_id_2 = create_test_node_id(2);
         assert!(!receiver._is_neighbor("alice", &alice_node_id_2));
@@ -662,7 +674,7 @@ mod tests {
             },
         );
 
-        let receiver = create_test_receiver(neighbor_map).await;
+        let (receiver, _peer_rx) = create_test_receiver(neighbor_map).await;
         // Check all existing neighbors return true
         assert!(receiver._is_neighbor("alice", &alice_node_id));
         assert!(receiver._is_neighbor("bob", &bob_node_id));
@@ -686,12 +698,178 @@ mod tests {
             },
         );
 
-        let receiver = create_test_receiver(neighbor_map).await;
+        let (receiver, _peer_rx) = create_test_receiver(neighbor_map).await;
         // Exact match should work
         assert!(receiver._is_neighbor("alice", &alice_node_id));
 
         // Different case should not match
         assert!(!receiver._is_neighbor("Alice", &alice_node_id));
         assert!(!receiver._is_neighbor("ALICE", &alice_node_id));
+    }
+
+    #[tokio::test]
+    async fn test_execute_update_map_empty_name() {
+        let neighbor_map = Arc::new(DashMap::new());
+        let (receiver, mut peer_rx) = create_test_receiver(neighbor_map.clone()).await;
+
+        let node = Node {
+            name: "".to_string(),
+            node_id: create_test_node_id(1),
+            count: 0,
+        };
+
+        receiver._execute_update_map(node.clone()).unwrap();
+
+        // Node should be inserted despite empty name
+        assert_eq!(neighbor_map.len(), 0);
+        assert!(!neighbor_map.contains_key(""));
+
+        // Verify no message sent to peer_tx
+        assert!(peer_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_execute_update_map_new_peer() {
+        let neighbor_map = Arc::new(DashMap::new());
+        let (receiver, mut peer_rx) = create_test_receiver(neighbor_map.clone()).await;
+
+        let node = Node {
+            name: "alice".to_string(),
+            node_id: create_test_node_id(1),
+            count: 0,
+        };
+
+        receiver._execute_update_map(node.clone()).unwrap();
+
+        // Verify node added to map
+        assert_eq!(neighbor_map.len(), 1);
+        let entry = neighbor_map.get("alice").unwrap();
+        assert_eq!(entry.node_id, node.node_id);
+
+        // Verify peer_tx received the node_id
+        assert_eq!(peer_rx.try_recv().unwrap(), node.node_id);
+    }
+
+    #[tokio::test]
+    async fn test_execute_update_map_existing_peer_updates_timestamp() {
+        let neighbor_map = Arc::new(DashMap::new());
+        let node_id = create_test_node_id(1);
+
+        // Insert initial entry with old timestamp
+        let old_timestamp = Instant::now() - Duration::from_secs(10);
+        neighbor_map.insert(
+            "alice".to_string(),
+            NodeInfo {
+                node_id,
+                last_seen: old_timestamp,
+            },
+        );
+
+        let (receiver, mut peer_rx) = create_test_receiver(neighbor_map.clone()).await;
+
+        let node = Node {
+            name: "alice".to_string(),
+            node_id,
+            count: 5,
+        };
+
+        let before_update = Instant::now();
+        receiver._execute_update_map(node).unwrap();
+        let after_update = Instant::now();
+
+        // Verify map still has one entry
+        assert_eq!(neighbor_map.len(), 1);
+
+        // Verify timestamp was updated
+        let entry = neighbor_map.get("alice").unwrap();
+        assert!(entry.last_seen >= before_update);
+        assert!(entry.last_seen <= after_update);
+        assert!(entry.last_seen > old_timestamp);
+
+        // Verify no peer_tx message sent (already a neighbor)
+        assert!(peer_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_execute_update_map_same_name_different_node_id() {
+        let neighbor_map = Arc::new(DashMap::new());
+
+        // Insert alice with node_id 1
+        let old_node_id = create_test_node_id(1);
+        neighbor_map.insert(
+            "alice".to_string(),
+            NodeInfo {
+                node_id: old_node_id,
+                last_seen: Instant::now(),
+            },
+        );
+
+        let (receiver, mut peer_rx) = create_test_receiver(neighbor_map.clone()).await;
+
+        // Try to add alice with node_id 2 (restarted node scenario)
+        let new_node_id = create_test_node_id(2);
+        let node = Node {
+            name: "alice".to_string(),
+            node_id: new_node_id,
+            count: 0,
+        };
+
+        receiver._execute_update_map(node.clone()).unwrap();
+
+        // Should update the map with new node_id
+        assert_eq!(neighbor_map.len(), 1);
+        let entry = neighbor_map.get("alice").unwrap();
+        assert_eq!(entry.node_id, new_node_id);
+
+        // Verify peer_tx received the new node_id (since it's a different node)
+        assert_eq!(peer_rx.try_recv().unwrap(), new_node_id);
+    }
+
+    #[tokio::test]
+    async fn test_execute_update_map_channel_send_error() {
+        let neighbor_map = Arc::new(DashMap::new());
+
+        // Create endpoint and gossip
+        let endpoint = iroh::Endpoint::builder()
+            .discovery_n0()
+            .bind()
+            .await
+            .expect("Failed to create test endpoint");
+
+        let gossip = Gossip::builder()
+            .spawn(endpoint.clone())
+            .await
+            .expect("Failed to spawn gossip");
+
+        let topic_id = TopicId::from([0u8; 32]);
+        let (_, receiver_stream) = gossip
+            .subscribe(topic_id, vec![])
+            .expect("Failed to subscribe")
+            .split();
+
+        // Create channel but immediately drop receiver to cause send error
+        let (peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(peer_rx);
+
+        let receiver = GossipDiscoveryReceiver {
+            neighbor_map,
+            peer_tx,
+            receiver: receiver_stream,
+            expiration_timeout: Duration::from_secs(30),
+        };
+
+        let node = Node {
+            name: "alice".to_string(),
+            node_id: create_test_node_id(1),
+            count: 0,
+        };
+
+        // Should return ChannelSend error
+        let result = receiver._execute_update_map(node);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            GossipDiscoveryError::ChannelSend => {}
+            _ => panic!("Expected ChannelSend error"),
+        }
     }
 }
