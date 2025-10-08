@@ -239,15 +239,6 @@ impl GossipDiscoveryReceiver {
                             .send(value.node_id)
                             .map_err(|_| GossipDiscoveryError::ChannelSend)?;
                         info!(name = %value.name, node_id = %value.node_id, "Discovered new peer");
-
-                        self.neighbor_map.insert(
-                            value.name.clone(),
-                            NodeInfo {
-                                node_id: value.node_id,
-                                last_seen: Instant::now(),
-                            },
-                        );
-                        debug!(peer_count = self.neighbor_map.len(), "Address book updated");
                     } else {
                         info!(
                             name = value.name,
@@ -255,6 +246,15 @@ impl GossipDiscoveryReceiver {
                             "Ignoring existing peer"
                         );
                     }
+
+                    self.neighbor_map.insert(
+                        value.name.clone(),
+                        NodeInfo {
+                            node_id: value.node_id,
+                            last_seen: Instant::now(),
+                        },
+                    );
+                    debug!(peer_count = self.neighbor_map.len(), "Address book updated");
                 }
                 Ok(_) => {}
                 Err(e) => {
