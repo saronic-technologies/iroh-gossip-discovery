@@ -10,7 +10,8 @@ use tokio::time::Duration;
 use tracing::info;
 
 use crate::{
-    common::IrohGossipDiscoveryResult, receiver::GossipDiscoveryReceiver,
+    common::{GossipDiscoveryError, IrohGossipDiscoveryResult},
+    receiver::GossipDiscoveryReceiver,
     sender::GossipDiscoverySender,
 };
 
@@ -40,7 +41,10 @@ impl GossipDiscoveryBuilder {
         // - First node (empty peers): use subscribe() only
         // - Other nodes (with peers): use subscribe_and_join()
         info!(topic_id = ?topic_id, peers = ?peers, "Attempting to subscribe to gossip");
-        let (sender, receiver) = gossip.subscribe(topic_id, peers)?.split();
+        let (sender, receiver) = match gossip.subscribe(topic_id, peers).await {
+            Ok(gossip) => gossip.split(),
+            Err(e) => return Err(GossipDiscoveryError::ApiError(e)),
+        };
         info!(topic_id = ?topic_id, "Subscribed to gossip topic");
 
         let (peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel();

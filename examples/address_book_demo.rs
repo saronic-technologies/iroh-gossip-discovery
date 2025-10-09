@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     info!(name = %node_name, node_id = %endpoint.node_id(), "Node started");
 
-    let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
+    let gossip = Gossip::builder().spawn(endpoint.clone());
 
     // Set up the router with gossip ALPN (required for gossip protocol)
     use iroh::protocol::Router;

@@ -1,13 +1,13 @@
 use ed25519_dalek::SigningKey;
 
 use iroh::NodeId;
-use iroh_gossip::net::GossipSender;
 
+use iroh_gossip::api::GossipSender;
 use tokio::sync::mpsc::{error::TryRecvError, UnboundedReceiver};
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
-use crate::common::{IrohGossipDiscoveryResult, Node, SignedMessage};
+use crate::common::{GossipDiscoveryError, IrohGossipDiscoveryResult, Node, SignedMessage};
 
 pub struct GossipDiscoverySender {
     pub peer_rx: UnboundedReceiver<NodeId>,
@@ -23,7 +23,11 @@ impl GossipDiscoverySender {
                 peer_count = peers.len(),
                 "Adding external peers to gossip network"
             );
-            self.sender.join_peers(peers).await?;
+
+            match self.sender.join_peers(peers).await {
+                Ok(_) => (),
+                Err(e) => return Err(GossipDiscoveryError::ApiError(e)),
+            };
         }
         Ok(())
     }

@@ -80,6 +80,8 @@ pub enum GossipDiscoveryError {
     SignatureVerification(String),
     #[error("NodeId mismatch: expected {expected}, got {actual}")]
     NodeIdMismatch { expected: NodeId, actual: NodeId },
+    #[error("Api error")]
+    ApiError(#[from] iroh_gossip::api::ApiError),
 }
 
 pub type IrohGossipDiscoveryResult<T> = std::result::Result<T, GossipDiscoveryError>;

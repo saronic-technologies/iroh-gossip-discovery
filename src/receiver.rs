@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use futures::StreamExt;
 
 use iroh::{NodeId, PublicKey};
-use iroh_gossip::net::{Event, GossipEvent, GossipReceiver};
+use iroh_gossip::api::{Event, GossipReceiver};
 use tokio::sync::RwLock;
 
 use std::sync::Arc;
@@ -43,7 +43,7 @@ impl GossipDiscoveryReceiver {
     pub async fn update_map(&mut self) -> IrohGossipDiscoveryResult<()> {
         while let Some(res) = self.receiver.write().await.next().await {
             match res {
-                Ok(Event::Gossip(GossipEvent::Received(msg))) => {
+                Ok(Event::Received(msg)) => {
                     // Verify and decode the signed message
                     let (_, value) = match SignedMessage::verify_and_decode(&msg.content) {
                         Ok(result) => result,
@@ -189,7 +189,8 @@ mod tests {
     // Helper function to create valid NodeIds for testing
     fn create_test_node_id(seed: u8) -> NodeId {
         let signing_key = SigningKey::from_bytes(&[seed; 32]);
-        NodeId::from(signing_key.verifying_key())
+        NodeId::from_bytes(signing_key.verifying_key().as_bytes())
+            .expect("could not create node id from bytes")
     }
 
     // Helper to create a GossipDiscoveryReceiver for testing
@@ -204,10 +205,7 @@ mod tests {
             .expect("Failed to create test endpoint");
 
         // Create gossip instance
-        let gossip = Gossip::builder()
-            .spawn(endpoint.clone())
-            .await
-            .expect("Failed to spawn gossip");
+        let gossip = Gossip::builder().spawn(endpoint.clone());
 
         // Create a test topic
         let topic_id = TopicId::from([0u8; 32]);
@@ -215,6 +213,7 @@ mod tests {
         // Subscribe to get a receiver
         let (_, receiver) = gossip
             .subscribe(topic_id, vec![])
+            .await
             .expect("Failed to subscribe")
             .split();
 
@@ -658,14 +657,12 @@ mod tests {
             .await
             .expect("Failed to create test endpoint");
 
-        let gossip = Gossip::builder()
-            .spawn(endpoint.clone())
-            .await
-            .expect("Failed to spawn gossip");
+        let gossip = Gossip::builder().spawn(endpoint.clone());
 
         let topic_id = TopicId::from([0u8; 32]);
         let (_, receiver_stream) = gossip
             .subscribe(topic_id, vec![])
+            .await
             .expect("Failed to subscribe")
             .split();
 
