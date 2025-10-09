@@ -1,11 +1,11 @@
 use iroh::NodeId;
 use iroh_gossip::{net::Gossip, proto::TopicId};
-use iroh_gossip_discovery::{GossipDiscoveryBuilder, Node};
+use iroh_gossip_discovery::{builder::GossipDiscoveryBuilder, common::Node};
 use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::time::{Duration, sleep};
-use tracing::{info, error};
+use tokio::time::{sleep, Duration};
+use tracing::{error, info};
 use tracing_subscriber;
 
 #[tokio::main]
@@ -19,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compact()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "iroh_gossip_discovery=info".into())
+                .unwrap_or_else(|_| "iroh_gossip_discovery=info".into()),
         )
         .init();
 
@@ -47,13 +47,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(name = %node_name, node_id = %endpoint.node_id(), "Node started");
 
     let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
-    
+
     // Set up the router with gossip ALPN (required for gossip protocol)
     use iroh::protocol::Router;
     let _router = Router::builder(endpoint.clone())
         .accept(iroh_gossip::ALPN, gossip.clone())
         .spawn();
-    
+
     let topic_id = TopicId::from([
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
         26, 27, 28, 29, 30, 31, 32,
